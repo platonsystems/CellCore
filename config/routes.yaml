@@ -9,3 +9,7 @@
 
 controllers:
     resource: routing.controllers
+
+app_plugin:
+    resource: .
+    type: plugin
