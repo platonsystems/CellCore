@@ -1,8 +1,8 @@
 <?php
 
-namespace App\Routing;
+namespace App\Service\Routing;
 
-use App\Service\PluginManager;
+use App\Service\Service\PluginManager;
 
 use ReflectionClass;
 use RuntimeException;

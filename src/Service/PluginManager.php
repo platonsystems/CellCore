@@ -1,282 +1,176 @@
 <?php
 
-namespace App\Service;
+namespace App\Service\Service;
 
-use Exception;
-
-use App\Entity\Plugin;
-use App\Event\SystemEvents;
-use App\Event\System\PluginEvent;
-use App\Contracts\PluginInterface;
-use App\Event\System\PluginBootEvent;
-use App\Repository\PluginRepository;
-
-use Psr\Log\LoggerInterface;
-use Psr\Container\NotFoundExceptionInterface;
-use Psr\Container\ContainerExceptionInterface;
-
-use ReflectionClass;
-use ReflectionMethod;
-use ReflectionException;
-
+use App\Service\Entity\Plugin;
+use App\Service\Repository\PluginRepository;
+use App\Service\Contracts\PluginInterface;
+use Doctrine\ORM\EntityManagerInterface;
 use Symfony\Component\DependencyInjection\Attribute\Autowire;
-use Symfony\Component\DependencyInjection\Attribute\AutowireLocator;
+use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\DependencyInjection\ServiceLocator;
-use Symfony\Component\EventDispatcher\Attribute\AsEventListener;
-use Symfony\Component\EventDispatcher\EventDispatcherInterface;
-use Symfony\Component\HttpFoundation\Request;
-use Symfony\Component\HttpFoundation\Response;
+use Psr\Log\LoggerInterface;
 
 class PluginManager
 {
-    private array $enabledPlugins = [];
+    private string $appsDir;
+    private string $pluginCacheFile;
 
     public function __construct(
-        private readonly PluginRepository $repository,
-        #[AutowireLocator('app.plugin')]
-        private readonly ServiceLocator $pluginLocator,
-        private readonly LoggerInterface $logger,
-        private readonly EventDispatcherInterface $eventDispatcher,
+        private PluginRepository $pluginRepository,
+        private EntityManagerInterface $entityManager,
+        private LoggerInterface $logger,
+        #[Autowire('%kernel.project_dir%/apps')] string $appsDir,
+        #[Autowire('%kernel.project_dir%/config/installed_plugins.php')] string $pluginCacheFile,
+        #[AutowireLocator('app.plugin_handler')] private ServiceLocator $locator
     ) {
+        $this->appsDir = $appsDir;
+        $this->pluginCacheFile = $pluginCacheFile;
     }
 
     /**
-     * @return Plugin[]
+     * Scans the file system and syncs with Database
      */
-    public function getEnabledPlugins(): array
+    public function refreshPlugins(): void
     {
-        return $this->repository->getEnabledPlugins();
+        // 1. Find all manifest.json files
+        $manifests = $this->scanDirectory($this->appsDir);
+
+        $fsPlugins = [];
+
+        foreach ($manifests as $path) {
+            $data = json_decode(file_get_contents($path), true);
+            if (!$data) continue;
+
+            $pluginId = $data['id'];
+            $fsPlugins[] = $pluginId;
+
+            // Sync with DB
+            $plugin = $this->pluginRepository->findOneBy(['pluginId' => $pluginId]);
+            if (!$plugin) {
+                $plugin = new Plugin();
+                $plugin->setPluginId($pluginId);
+            }
+
+            // Update Metadata from Manifest
+            $plugin->setName($data['name'] ?? 'Unknown');
+            $plugin->setGroupName($data['group'] ?? 'default');
+            $plugin->setVersion($data['version'] ?? '1.0.0');
+            $plugin->setDescription($data['description'] ?? '');
+            $plugin->setIcon($data['icon'] ?? null);
+            $plugin->setEntryPoint($data['entry_point'] ?? null); // The Bundle Class
+            $plugin->setPermissions($data['permissions'] ?? []);
+
+            $this->entityManager->persist($plugin);
+        }
+
+        $this->entityManager->flush();
     }
 
-    #[AsEventListener(SystemEvents::BOOT)]
-    public function onBoot(): void
+    /**
+     * Enables the plugin and registers the bundle in the config cache
+     */
+    public function enable(Plugin $plugin): void
     {
-        $plugins = $this->getEnabledPlugins();
-        foreach ($plugins as $plugin) {
-            $this->enabledPlugins[] = $plugin;
-            $event = new PluginBootEvent($plugin);
-            $this->eventDispatcher->dispatch($event, SystemEvents::PLUGIN_BOOT);
-        }
-    }
-
-    public function enable(string|Plugin $plugin): void
-    {
-        $plugin = is_string($plugin) ? $this->getPluginByHandle($plugin) : $plugin;
-        if (!$plugin) {
-            return;
-        }
-        $pluginInstance = $this->getPluginInstance($plugin);
-        $pluginInstance->enable();
         $plugin->setEnabled(true);
-        $this->eventDispatcher->dispatch(
-            new PluginEvent('enable', $plugin),
-            SystemEvents::PLUGIN_ENABLE
-        );
-        $this->repository->save($plugin, true);
+        $this->entityManager->flush();
+        $this->dumpPluginCache();
     }
 
-    public function disable(string|Plugin $plugin): void
+    /**
+     * Disables the plugin and removes it from config cache
+     */
+    public function disable(Plugin $plugin): void
     {
-        $plugin = is_string($plugin) ? $this->getPluginByHandle($plugin) : $plugin;
-        if (!$plugin) {
-            return;
-        }
-        $pluginInstance = $this->getPluginInstance($plugin);
-        $pluginInstance->disable();
         $plugin->setEnabled(false);
-        $this->eventDispatcher->dispatch(
-            new PluginEvent('disable', $plugin),
-            SystemEvents::PLUGIN_DISABLE
-        );
-        $this->repository->save($plugin, true);
-    }
-
-    public function upgrade(Plugin $plugin): void
-    {
-        $pluginInstance = $this->getPluginInstance($plugin);
-        if (!$pluginInstance) {
-            return;
-        }
-        try {
-            $pluginInstance->upgrade();
-        } catch (Exception $e) {
-            $this->logger->error('Plugin upgrade failed: ' . $plugin->getHandle(), ['exception' => [
-                'code' => $e->getCode(),
-                'message' => $e->getMessage(),
-            ]]);
-            return;
-        }
-        $plugin->setVersion($plugin->getLatestVersion());
-        $plugin->setUpgradable(false);
-        $this->eventDispatcher->dispatch(
-            new PluginEvent('upgrade', $plugin),
-            SystemEvents::PLUGIN_UPGRADE
-        );
-        $this->repository->save($plugin, true);
-    }
-
-    public function getPluginByHandle(string $handle): ?Plugin
-    {
-        return $this->repository->findOneByHandle($handle);
+        $this->entityManager->flush();
+        $this->dumpPluginCache();
     }
 
     public function install(Plugin $plugin): void
     {
-        $pluginInstance = $this->getPluginInstance($plugin);
-        if (!$pluginInstance) {
-            return;
+        // Execute the 'install' logic defined in the lifecycle class
+        $handler = $this->getLifecycleHandler($plugin);
+        if ($handler) {
+            $handler->install();
         }
-        try {
-            $pluginInstance->install();
-        } catch (Exception $e) {
-            $this->logger->error('Plugin installation failed: ' . $plugin->getHandle(), ['exception' => [
-                'code' => $e->getCode(),
-                'message' => $e->getMessage(),
-            ]]);
-            return;
-        }
+
         $plugin->setInstalled(true);
-        $this->eventDispatcher->dispatch(
-            new PluginEvent('install', $plugin),
-            SystemEvents::PLUGIN_INSTALL
-        );
-        $this->repository->save($plugin, true);
+        $this->entityManager->flush();
     }
 
     public function uninstall(Plugin $plugin): void
     {
-        $pluginInstance = $this->getPluginInstance($plugin);
-        if (!$pluginInstance) {
-            return;
+        // Execute logic
+        $handler = $this->getLifecycleHandler($plugin);
+        if ($handler) {
+            $handler->uninstall();
         }
-        try {
-            $pluginInstance->uninstall();
-        } catch (Exception $e) {
-            $this->logger->error('Plugin uninstallation failed: ' . $plugin->getHandle(), ['exception' => [
-                'code' => $e->getCode(),
-                'message' => $e->getMessage(),
-            ]]);
-            return;
-        }
+
+        // Disable and remove
+        $this->disable($plugin);
         $plugin->setInstalled(false);
-        $plugin->setEnabled(false);
-        $plugin->setSettings([]);
-        $this->eventDispatcher->dispatch(
-            new PluginEvent('uninstall', $plugin),
-            SystemEvents::PLUGIN_UNINSTALL
-        );
-        $this->repository->save($plugin, true);
+        $this->entityManager->flush();
     }
 
-    public function getPlugins(): array
+    /**
+     * Recursively find manifest.json files
+     */
+    private function scanDirectory(string $dir): array
     {
-        $plugins = [];
-        $pluginFiles = $this->getPluginFiles();
+        $results = [];
+        $files = glob($dir . '/*');
+        foreach ($files as $file) {
+            if (is_dir($file)) {
+                $results = array_merge($results, $this->scanDirectory($file));
+            } elseif (basename($file) === 'manifest.json') {
+                $results[] = $file;
+            }
+        }
+        return $results;
+    }
 
-        foreach ($pluginFiles as $pluginFile) {
-            $className = $this->getClassName($pluginFile);
+    /**
+     * Rebuilds the PHP file that Kernel.php includes
+     */
+    private function dumpPluginCache(): void
+    {
+        $plugins = $this->pluginRepository->findBy(['enabled' => true]);
+        $bundles = [];
 
-            if ($this->isValidPluginClass($className)) {
-                $pluginData = $this->getPluginData($className);
-                $pluginEntity = $this->getPluginEntity($pluginData);
-                $plugins[] = $pluginEntity;
+        foreach ($plugins as $plugin) {
+            // We need the Namespace\Class of the Bundle
+            // e.g. Platon\InventoryBundle\InventoryBundle
+            if ($plugin->getEntryPoint()) {
+                $bundles[] = $plugin->getEntryPoint();
             }
         }
 
-        return $plugins;
+        $content = "<?php\nreturn [\n";
+        foreach ($bundles as $class) {
+            $content .= "    $class::class => ['all' => true],\n";
+        }
+        $content .= "];";
+
+        file_put_contents($this->pluginCacheFile, $content);
     }
 
-    public function getPluginInstance(string|Plugin $plugin): ?PluginInterface
+    /**
+     * Gets the Lifecycle Service (not the Bundle class) if defined
+     * Note: You need a way to instantiate this. Usually, the Bundle
+     * registers this service in the container.
+     */
+    private function getLifecycleHandler(Plugin $plugin): ?PluginInterface
     {
-        $pluginHandle = is_string($plugin) ? $plugin : $plugin->getHandle();
-        $pluginClass = 'App\\Plugin\\' . $pluginHandle;
+        // Implementation depends on how you name your services
+        // Example: 'platon_inventory.handler'
         try {
-            return $this->pluginLocator->get($pluginClass);
-        } catch (ContainerExceptionInterface | NotFoundExceptionInterface) {
-            $this->logger->error('Plugin not found: ' . $pluginClass);
+            // Simplified: assuming the entry point *is* the service ID for now
+            // or we use a factory.
+            return null; // TODO: Implement service lookup
+        } catch (\Exception $e) {
+            $this->logger->error("Could not load handler for " . $plugin->getName());
             return null;
         }
-    }
-
-    private function getPluginFiles(): array
-    {
-        return glob(__DIR__ . '/../Plugin/*.php');
-    }
-
-    private function getClassName(string $pluginFile): string
-    {
-        return 'App\\Plugin\\' . basename($pluginFile, '.php');
-    }
-
-    private function isValidPluginClass(string $className): bool
-    {
-        return class_exists($className) && in_array(PluginInterface::class, class_implements($className));
-    }
-
-    private function getPluginData(string $className): array
-    {
-        $reflectionClass = new ReflectionClass($className);
-        $methods = $reflectionClass->getMethods(ReflectionMethod::IS_PUBLIC);
-        $pluginData = [
-            'name' => '',
-            'version' => '0.0.1',
-            'description' => '',
-        ];
-
-        foreach ($methods as $method) {
-            if ($this->isPluginDataMethod($method)) {
-                $methodName = $method->getName();
-                try {
-                    $field = strtolower(str_replace('get', '', $methodName));
-                    $pluginData[$field] = $reflectionClass->getMethod($methodName)->invoke(null);
-                } catch (ReflectionException) {
-                    continue;
-                }
-            }
-        }
-
-        $pluginData['handle'] = $reflectionClass->getShortName();
-
-        return $pluginData;
-    }
-
-    private function isPluginDataMethod(ReflectionMethod $method): bool
-    {
-        return $method->isStatic() &&
-            $method->isPublic() &&
-            $method->getNumberOfRequiredParameters() == 0 &&
-            in_array($method->getName(), ['getName', 'getVersion', 'getDescription']);
-    }
-
-    private function getPluginEntity(array $pluginData): Plugin
-    {
-        $pluginEntity = $this->repository->findOneBy(['handle' => $pluginData['handle']]);
-
-        if (!$pluginEntity) {
-            $pluginEntity = new Plugin();
-            $pluginEntity->setHandle($pluginData['handle']);
-            $pluginEntity->setName($pluginData['name'] ?? $pluginData['handle']);
-            $pluginEntity->setVersion($pluginData['version'] ?? '1.0.0');
-            $pluginEntity->setDescription($pluginData['description'] ?? '');
-            $pluginEntity->setInstalled(false);
-            $pluginEntity->setEnabled(false);
-            $this->repository->save($pluginEntity, true);
-            $this->eventDispatcher->dispatch(
-                new PluginEvent('register', $pluginEntity),
-                SystemEvents::PLUGIN_REGISTER
-            );
-        }
-
-        $pluginEntity->setUpgradable(
-            version_compare($pluginData['version'], $pluginEntity->getVersion(), '>')
-        );
-        $pluginEntity->setLatestVersion($pluginData['version']);
-
-        return $pluginEntity;
-    }
-
-    public function manage(Plugin $plugin, Request $request): ?Response {
-        $pluginInstance = $this->getPluginInstance($plugin);
-        return $pluginInstance?->manage($request, $plugin);
     }
 }

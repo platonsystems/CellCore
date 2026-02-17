@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Event\System;
+namespace App\Service\Event\System;
 
 class PluginEvent
 {

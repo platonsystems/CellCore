@@ -1,8 +1,10 @@
 <?php
 
-namespace App\Repository;
+namespace App\Service\Repository;
 
 class PluginRepository
 {
-
+    public function getEnabledPlugins(): array {
+        return [];
+    }
 }

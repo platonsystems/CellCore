@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Contracts;
+namespace App\Service\Contracts;
 
 interface MenuProviderInterface {
     /** @return array<string, mixed> Returns menu items, routes, and icons */
