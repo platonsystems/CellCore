@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Service\Contracts;
+namespace App\Contracts;
 
 use Symfony\Component\Routing\RouteCollection;
 

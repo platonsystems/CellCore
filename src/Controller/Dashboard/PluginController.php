@@ -1,9 +1,9 @@
 <?php
 
-namespace App\Service\Controller\Dashboard;
+namespace App\Controller\Dashboard;
 
-use App\Service\Entity\Plugin;
-use App\Service\Service\PluginManager;
+use App\Entity\Plugin;
+use App\Service\PluginManager;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\Routing\Attribute\Route;

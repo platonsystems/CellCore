@@ -2,7 +2,7 @@
 
 namespace App\Service;
 
-use App\Service\Contracts\PluginInterface;
+use App\Contracts\PluginInterface;
 use Symfony\Component\Routing\RouteCollection;
 
 abstract class AbstractPlugin implements PluginInterface

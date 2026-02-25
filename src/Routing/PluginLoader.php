@@ -1,8 +1,8 @@
 <?php
 
-namespace App\Service\Routing;
+namespace App\Routing;
 
-use App\Service\Service\PluginManager;
+use App\Service\PluginManager;
 
 use ReflectionClass;
 use RuntimeException;
@@ -16,8 +16,7 @@ class PluginLoader extends Loader
     private bool $isLoaded = false;
     private PluginManager $pluginManager;
 
-    public function __construct(PluginManager $pluginManager, ?string $env = null)
-    {
+    public function __construct(PluginManager $pluginManager, ?string $env = null) {
         $this->pluginManager = $pluginManager;
         parent::__construct($env);
     }

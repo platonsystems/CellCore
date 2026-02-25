@@ -1,0 +1,17 @@
+pentatrion_vite:
+    public_directory: public
+    build_directory: build
+    proxy_origin: null
+    absolute_url: false
+    throw_on_missing_entry: false
+    throw_on_missing_asset: true
+    cache: false
+    preload: link-tag
+    crossorigin: true
+    script_attributes: {  }
+    link_attributes: {  }
+    preload_attributes: {  }
+    default_build: null
+    builds: {  }
+    default_config: null
+    configs: {  }

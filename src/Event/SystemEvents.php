@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Service\Event;
+namespace App\Event;
 
 class SystemEvents
 {

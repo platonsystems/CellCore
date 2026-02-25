@@ -1,6 +1,6 @@
 <?php
 
-namespace App\Service\Event\System;
+namespace App\Event\System;
 
 class PluginBootEvent
 {
